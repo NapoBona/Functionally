@@ -1537,6 +1537,20 @@ button {
   font-weight: 500;
 }
 
+.row-actions {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.teacher-day-setting.form-row {
+  grid-template-columns: minmax(90px, 1fr) minmax(90px, 1.4fr) minmax(90px, 1fr);
+}
+
+.teacher-day-setting.form-row:has(> select:only-of-type) {
+  grid-template-columns: minmax(90px, 1fr) minmax(120px, 2fr);
+}
+
 .exam-row {
   display: flex;
   min-height: 58px;

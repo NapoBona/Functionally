@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+﻿import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import {
   Activity,
   Bell,
@@ -55,7 +55,9 @@ import {
   type DemoData,
   type Exam,
   type Lesson,
+  type Student,
   type SubjectId,
+  type Tutor,
 } from "./mockData";
 import "./design.css";
 
@@ -95,7 +97,21 @@ interface ManagerNotice {
   kind: "info" | "warning";
 }
 
+interface Catalog {
+  teachers: Tutor[];
+  students: Student[];
+  exams: Exam[];
+  locations: string[];
+}
+
+type EntityDraft =
+  | { kind: "teacher"; id?: string; name: string; subjectIds: SubjectId[]; days: Record<number, { on: boolean; start: number; end: number }> }
+  | { kind: "student"; id?: string; firstName: string; secondInitial: string; grade: string; homeroomId: string; subjectIds: SubjectId[]; teacherBySubject: Partial<Record<SubjectId, string>> }
+  | { kind: "exam"; id?: string; title: string; grade: string; subjectId: SubjectId; date: string; period: number }
+  | { kind: "location"; id?: string; name: string };
+
 interface StoredData extends DemoData {
+  catalog: Catalog;
   updates: ClassUpdate[];
   excusalOverrides: Record<string, boolean>;
   notices: ManagerNotice[];
@@ -134,10 +150,40 @@ interface LessonDraft {
   teacherId: string;
   studentIds: string[];
   location: string;
+  groupName?: string;
+  asGroup?: boolean;
 }
 
 const STORAGE_KEY = "functi-on-demo-v1";
 const THEME_KEY = "functi-on-theme-v1";
+const GRADES = ["ט׳", "י׳", "י״א", "י״ב"];
+
+// The mock data module exposes mutable arrays; the catalog edits them in place so every lookup stays in sync.
+const pristineCatalog: Catalog = structuredClone({ teachers, students, exams, locations });
+
+function applyCatalog(catalog: Catalog) {
+  teachers.splice(0, teachers.length, ...catalog.teachers);
+  students.splice(0, students.length, ...catalog.students);
+  exams.splice(0, exams.length, ...catalog.exams);
+  locations.splice(0, locations.length, ...catalog.locations);
+  for (const homeroom of homerooms) {
+    homeroom.studentIds = catalog.students.filter((student) => student.homeroomId === homeroom.id).map((student) => student.id);
+  }
+}
+
+function dateToOffset(value: string) {
+  const target = new Date(`${value}T00:00:00`);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return Math.round((target.getTime() - today.getTime()) / 86400000);
+}
+
+function offsetToDate(offset: number) {
+  const date = new Date();
+  date.setDate(date.getDate() + offset);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
 
 const initialUpdates: ClassUpdate[] = [
   {
@@ -203,7 +249,9 @@ const pageTitles: Record<View, { title: string; subtitle: string }> = {
 const subjectClass = (subjectId: SubjectId) => `subject-${subjectColor(subjectId)}`;
 
 function seedData(): StoredData {
-  return { ...buildInitialDemoData(), updates: initialUpdates, excusalOverrides: {}, notices: [] };
+  const catalog = structuredClone(pristineCatalog);
+  applyCatalog(catalog);
+  return { ...buildInitialDemoData(), catalog, updates: initialUpdates, excusalOverrides: {}, notices: [] };
 }
 
 function readData(): { data: StoredData; warning: string } {
@@ -215,9 +263,15 @@ function readData(): { data: StoredData; warning: string } {
     if (!Array.isArray(parsed.lessons) || !Array.isArray(parsed.aides) || !Array.isArray(parsed.logs)) {
       throw new Error("Demo data is missing required collections.");
     }
+    const catalog: Catalog = parsed.catalog && Array.isArray(parsed.catalog.teachers) && Array.isArray(parsed.catalog.students) &&
+      Array.isArray(parsed.catalog.exams) && Array.isArray(parsed.catalog.locations)
+      ? parsed.catalog
+      : structuredClone(pristineCatalog);
+    applyCatalog(catalog);
     return {
       data: {
         ...parsed,
+        catalog,
         updates: Array.isArray(parsed.updates) ? parsed.updates : initialUpdates,
         teacherMinimums: parsed.teacherMinimums ?? {},
         excusalOverrides: parsed.excusalOverrides ?? {},
@@ -330,6 +384,8 @@ function App() {
   const [showUpdateForm, setShowUpdateForm] = useState(false);
   const [navCollapsed, setNavCollapsed] = useState(false);
   const [overviewRailCollapsed, setOverviewRailCollapsed] = useState(false);
+  const [entityDraft, setEntityDraft] = useState<EntityDraft | null>(null);
+  const [entityError, setEntityError] = useState("");
 
   useEffect(() => {
     document.documentElement.lang = "he";
@@ -446,6 +502,210 @@ function App() {
     });
   }
 
+  function commitCatalog(update: (catalog: Catalog) => Catalog, extra?: (state: StoredData) => StoredData) {
+    const next = update(rawData.catalog);
+    applyCatalog(next);
+    setData((current) => {
+      const state = { ...current, catalog: next };
+      return extra ? extra(state) : state;
+    });
+  }
+
+  function openEntity(draft: EntityDraft) {
+    setEntityError("");
+    setEntityDraft(draft);
+  }
+
+  function newTeacherDraft(): EntityDraft {
+    return { kind: "teacher", name: "", subjectIds: [], days: Object.fromEntries(DAYS.map((day) => [day.index, { on: day.index < 5, start: 0, end: 5 }])) };
+  }
+
+  function editTeacherDraft(teacher: Tutor): EntityDraft {
+    return {
+      kind: "teacher",
+      id: teacher.id,
+      name: teacher.name,
+      subjectIds: teacher.subjectIds,
+      days: Object.fromEntries(DAYS.map((day) => {
+        const window = teacher.workWindows[day.index];
+        return [day.index, { on: Boolean(window), start: window?.startPeriod ?? 0, end: window?.endPeriod ?? 5 }];
+      })),
+    };
+  }
+
+  function newStudentDraft(): EntityDraft {
+    const grade = GRADES[0];
+    return { kind: "student", firstName: "", secondInitial: "", grade, homeroomId: homerooms.find((room) => room.grade === grade)?.id ?? "", subjectIds: [], teacherBySubject: {} };
+  }
+
+  function editStudentDraft(student: Student): EntityDraft {
+    return {
+      kind: "student",
+      id: student.id,
+      firstName: student.firstName,
+      secondInitial: student.secondInitial,
+      grade: student.grade,
+      homeroomId: student.homeroomId,
+      subjectIds: student.subjectIds,
+      teacherBySubject: student.teacherBySubject,
+    };
+  }
+
+  function newExamDraft(): EntityDraft {
+    return { kind: "exam", title: "", grade: GRADES[0], subjectId: SUBJECTS[0].id, date: offsetToDate(7), period: 0 };
+  }
+
+  function editExamDraft(exam: Exam): EntityDraft {
+    return { kind: "exam", id: exam.id, title: exam.title, grade: exam.grade, subjectId: exam.subjectId, date: offsetToDate(exam.dateOffset), period: exam.period };
+  }
+
+  function saveEntity(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!entityDraft) return;
+    const fail = (message: string) => setEntityError(message);
+
+    if (entityDraft.kind === "teacher") {
+      const name = entityDraft.name.trim();
+      if (!name) return fail("יש להזין שם מורה.");
+      if (entityDraft.subjectIds.length === 0) return fail("יש לבחור לפחות מקצוע אחד.");
+      const activeDays = DAYS.filter((day) => entityDraft.days[day.index]?.on);
+      if (activeDays.length === 0) return fail("יש לבחור לפחות יום עבודה אחד.");
+      if (activeDays.some((day) => entityDraft.days[day.index].end <= entityDraft.days[day.index].start)) return fail("שעת הסיום חייבת להיות אחרי שעת ההתחלה.");
+      const existing = entityDraft.id ? getTeacher(entityDraft.id) : undefined;
+      const workWindows: Tutor["workWindows"] = {};
+      for (const day of activeDays) {
+        const value = entityDraft.days[day.index];
+        workWindows[day.index] = { startPeriod: value.start, endPeriod: value.end, minimumSpanMinutes: existing?.workWindows[day.index]?.minimumSpanMinutes ?? 180 };
+      }
+      if (existing) {
+        const misfits = rawData.lessons.filter((lesson) => {
+          if (lesson.teacherId !== existing.id) return false;
+          const window = workWindows[lesson.day];
+          return !entityDraft.subjectIds.includes(lesson.subjectId) || !window || lesson.period < window.startPeriod || lesson.period >= window.endPeriod;
+        });
+        if (misfits.length) return fail(`${misfits.length} שיבוצים קיימים של המורה אינם מתאימים למקצועות או לשעות החדשים. יש להעביר אותם קודם.`);
+      }
+      const teacher: Tutor = {
+        id: existing?.id ?? `teacher-${Date.now()}`,
+        name,
+        initials: name.split(" ").map((part) => part[0]).join(""),
+        subjectIds: entityDraft.subjectIds,
+        workWindows,
+      };
+      commitCatalog((catalog) => ({ ...catalog, teachers: existing ? catalog.teachers.map((item) => item.id === existing.id ? teacher : item) : [...catalog.teachers, teacher] }));
+      setToast(existing ? "פרטי המורה עודכנו" : "המורה נוספה");
+    } else if (entityDraft.kind === "student") {
+      const firstName = entityDraft.firstName.trim();
+      const secondInitial = entityDraft.secondInitial.trim().slice(0, 1);
+      if (!firstName || !secondInitial) return fail("יש להזין שם פרטי ואות ראשונה של השם השני.");
+      if (!entityDraft.homeroomId) return fail("יש לבחור כיתה.");
+      if (entityDraft.subjectIds.length === 0) return fail("יש לבחור לפחות מקצוע תגבור אחד.");
+      const teacherBySubject: Student["teacherBySubject"] = {};
+      for (const subjectId of entityDraft.subjectIds) {
+        const teacherId = entityDraft.teacherBySubject[subjectId];
+        if (teacherId && getTeacher(teacherId)?.subjectIds.includes(subjectId)) teacherBySubject[subjectId] = teacherId;
+      }
+      const student: Student = {
+        id: entityDraft.id ?? `student-${Date.now()}`,
+        firstName,
+        secondInitial,
+        displayName: `${firstName} ${secondInitial}׳`,
+        grade: entityDraft.grade,
+        homeroomId: entityDraft.homeroomId,
+        subjectIds: entityDraft.subjectIds,
+        teacherBySubject,
+      };
+      commitCatalog((catalog) => ({ ...catalog, students: entityDraft.id ? catalog.students.map((item) => item.id === student.id ? student : item) : [...catalog.students, student] }));
+      setToast(entityDraft.id ? "פרטי התלמיד/ה עודכנו" : "התלמיד/ה נוסף/ה");
+    } else if (entityDraft.kind === "exam") {
+      const title = entityDraft.title.trim();
+      if (!title) return fail("יש להזין כותרת למבחן.");
+      if (!entityDraft.date) return fail("יש לבחור תאריך.");
+      const day = new Date(`${entityDraft.date}T00:00:00`).getDay();
+      if (day > 5) return fail("אין לימודים בשבת. יש לבחור יום אחר.");
+      const exam: Exam = {
+        id: entityDraft.id ?? `exam-${Date.now()}`,
+        title,
+        grade: entityDraft.grade,
+        subjectId: entityDraft.subjectId,
+        day,
+        period: entityDraft.period,
+        dateOffset: dateToOffset(entityDraft.date),
+      };
+      commitCatalog((catalog) => ({ ...catalog, exams: entityDraft.id ? catalog.exams.map((item) => item.id === exam.id ? exam : item) : [...catalog.exams, exam] }));
+      setToast(entityDraft.id ? "המבחן עודכן" : "המבחן נוסף");
+    } else {
+      const name = entityDraft.name.trim();
+      if (!name) return fail("יש להזין שם מיקום.");
+      if (locations.some((item) => item === name && item !== entityDraft.id)) return fail("מיקום בשם הזה כבר קיים.");
+      const oldName = entityDraft.id;
+      commitCatalog(
+        (catalog) => ({ ...catalog, locations: oldName ? catalog.locations.map((item) => item === oldName ? name : item) : [...catalog.locations, name] }),
+        (state) => oldName && oldName !== name
+          ? { ...state, lessons: state.lessons.map((lesson) => lesson.location === oldName ? { ...lesson, location: name } : lesson) }
+          : state,
+      );
+      setToast(oldName ? "המיקום עודכן" : "המיקום נוסף");
+    }
+    setEntityDraft(null);
+  }
+
+  function deleteTeacher(teacher: Tutor) {
+    const used = rawData.lessons.filter((lesson) => lesson.teacherId === teacher.id).length;
+    if (used) { setToast(`לא ניתן למחוק: למורה יש ${used} שיבוצים. יש להעביר אותם קודם.`); return; }
+    if (teachers.length <= 1) { setToast("לא ניתן למחוק את המורה האחרונה"); return; }
+    if (!window.confirm(`למחוק את ${teacher.name}?`)) return;
+    const fallback = teachers.find((item) => item.id !== teacher.id)!.id;
+    commitCatalog((catalog) => ({
+      ...catalog,
+      teachers: catalog.teachers.filter((item) => item.id !== teacher.id),
+      students: catalog.students.map((student) => ({
+        ...student,
+        teacherBySubject: Object.fromEntries(Object.entries(student.teacherBySubject).filter(([, id]) => id !== teacher.id)),
+      })),
+    }));
+    if (selectedTeacherId === teacher.id) setSelectedTeacherId(fallback);
+    if (absentTeacherId === teacher.id) setAbsentTeacherId(fallback);
+    if (teacherFilter === teacher.id) setTeacherFilter("הכול");
+    setToast("המורה נמחקה");
+  }
+
+  function deleteStudent(student: Student) {
+    if (students.length <= 1) { setToast("לא ניתן למחוק את התלמיד/ה האחרון/ה"); return; }
+    const used = rawData.lessons.filter((lesson) => lesson.studentIds.includes(student.id)).length;
+    if (!window.confirm(used ? `למחוק את ${student.displayName}? הוא/היא יוסר/תוסר מ-${used} שיעורים, ושיעורים ללא משתתפים יימחקו.` : `למחוק את ${student.displayName}?`)) return;
+    const fallback = students.find((item) => item.id !== student.id)!.id;
+    commitCatalog(
+      (catalog) => ({ ...catalog, students: catalog.students.filter((item) => item.id !== student.id) }),
+      (state) => {
+        const lessons = state.lessons
+          .map((lesson) => lesson.studentIds.includes(student.id)
+            ? { ...lesson, studentIds: lesson.studentIds.filter((id) => id !== student.id), absentStudentIds: lesson.absentStudentIds.filter((id) => id !== student.id) }
+            : lesson)
+          .filter((lesson) => lesson.studentIds.length > 0);
+        const ids = new Set(lessons.map((lesson) => lesson.id));
+        return { ...state, lessons, logs: state.logs.filter((log) => ids.has(log.lessonId)) };
+      },
+    );
+    if (excusalStudentId === student.id) setExcusalStudentId(fallback);
+    setToast("התלמיד/ה נמחק/ה");
+  }
+
+  function deleteExam(exam: Exam) {
+    if (!window.confirm(`למחוק את המבחן "${exam.title}"?`)) return;
+    commitCatalog((catalog) => ({ ...catalog, exams: catalog.exams.filter((item) => item.id !== exam.id) }));
+    setToast("המבחן נמחק");
+  }
+
+  function deleteLocation(location: string) {
+    const used = rawData.lessons.filter((lesson) => lesson.location === location).length;
+    if (used) { setToast(`לא ניתן למחוק: ${used} שיבוצים משתמשים במיקום. יש לשנות אותם קודם.`); return; }
+    if (locations.length <= 1) { setToast("לא ניתן למחוק את המיקום האחרון"); return; }
+    if (!window.confirm(`למחוק את המיקום "${location}"?`)) return;
+    commitCatalog((catalog) => ({ ...catalog, locations: catalog.locations.filter((item) => item !== location) }));
+    setToast("המיקום נמחק");
+  }
+
   function openCreateLesson(day = selectedDay, period = 0, teacherId = teachers[0].id) {
     const teacher = getTeacher(teacherId) ?? teachers[0];
     setModalError("");
@@ -460,6 +720,11 @@ function App() {
     });
   }
 
+  function openCreateGroup() {
+    openCreateLesson();
+    setModalDraft((draft) => draft && { ...draft, asGroup: true, groupName: "" });
+  }
+
   function openEditLesson(lesson: Lesson) {
     setModalError("");
     setModalDraft({
@@ -471,6 +736,8 @@ function App() {
       teacherId: lesson.teacherId,
       studentIds: lesson.studentIds,
       location: lesson.location,
+      groupName: lesson.groupName,
+      asGroup: Boolean(lesson.groupId),
     });
   }
 
@@ -479,6 +746,10 @@ function App() {
     if (!modalDraft) return;
     if (modalDraft.studentIds.length === 0) {
       setModalError("יש לבחור לפחות תלמיד/ה אחד/ת.");
+      return;
+    }
+    if (modalDraft.asGroup && modalDraft.studentIds.length < 2) {
+      setModalError("קבוצה דורשת לפחות שני תלמידים/ות.");
       return;
     }
 
@@ -554,7 +825,7 @@ function App() {
       teacherId: modalDraft.teacherId,
       studentIds: modalDraft.studentIds,
       groupId,
-      groupName: groupId ? (sameGroup && original.groupName ? original.groupName : `קבוצת ${subjectName(modalDraft.subjectId)}`) : undefined,
+      groupName: groupId ? (modalDraft.groupName?.trim() || (sameGroup && original.groupName) || `קבוצת ${subjectName(modalDraft.subjectId)}`) : undefined,
       location: modalDraft.location,
       status: original?.status ?? "scheduled",
       absentStudentIds: original?.absentStudentIds.filter((id) => modalDraft.studentIds.includes(id)) ?? [],
@@ -1262,14 +1533,14 @@ function App() {
         <section className="panel">
           <div className="panel-heading">
             <div><h2>לוח מבחנים לפי שכבה</h2><p>מורות שעובדות עם השכבה והסייעת הרלוונטית רואות את המועדים.</p></div>
-            <button className="button button-primary" type="button" onClick={() => setToast("טופס הוספת מבחן יתווסף בהמשך")}>
+            <button className="button button-primary" type="button" onClick={() => openEntity(newExamDraft())}>
               <Plus size={16} /> מבחן חדש
             </button>
           </div>
           {grouped.map((group) => (
             <div className="grade-exams" key={group.grade}>
               <div className="grade-heading"><span>{group.grade}</span><small>{group.items.length} מועדים</small></div>
-              {group.items.map((exam) => <ExamRow exam={exam} key={exam.id} />)}
+              {group.items.map((exam) => <ExamRow exam={exam} key={exam.id} onEdit={role === "manager" ? () => openEntity(editExamDraft(exam)) : undefined} onDelete={role === "manager" ? () => deleteExam(exam) : undefined} />)}
             </div>
           ))}
         </section>
@@ -1443,7 +1714,7 @@ function App() {
       <section className="panel">
         <div className="panel-heading">
           <div><h2>רשימת תלמידים</h2><p>{students.length} תלמידים · שמות מוצגים בשם פרטי ובאות ראשונה של השם השני</p></div>
-          <button className="button button-primary" type="button" onClick={() => setToast("הוספת תלמיד/ה תתחבר למקור נתונים בשלב הבא")}><Plus size={16} /> תלמיד/ה חדש/ה</button>
+          <button className="button button-primary" type="button" onClick={() => openEntity(newStudentDraft())}><Plus size={16} /> תלמיד/ה חדש/ה</button>
         </div>
         <div className="filter-toolbar">
           <label className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="חיפוש לפי שם או כיתה" /></label>
@@ -1453,7 +1724,7 @@ function App() {
         </div>
         <div className="data-table-wrap">
           <table className="data-table">
-            <thead><tr><th>תלמיד/ה</th><th>כיתה</th><th>מקצועות תגבור</th><th>מורות משויכות</th><th>שיעורים בשבוע</th><th>סייעת</th></tr></thead>
+            <thead><tr><th>תלמיד/ה</th><th>כיתה</th><th>מקצועות תגבור</th><th>מורות משויכות</th><th>שיעורים בשבוע</th><th>סייעת</th><th>פעולות</th></tr></thead>
             <tbody>
               {filteredStudents.map((student) => {
                 const assigned = student.subjectIds
@@ -1470,6 +1741,7 @@ function App() {
                     <td>{uniqueTeachers.slice(0, 2).map((id) => getTeacher(id)?.name).filter(Boolean).join(" · ")}</td>
                     <td><strong>{sessionsPerWeek}</strong></td>
                     <td>{aide?.name ?? "—"}</td>
+                    <td><div className="row-actions"><IconButton label="עריכה" onClick={() => openEntity(editStudentDraft(student))}><Pencil size={15} /></IconButton><IconButton label="מחיקה" onClick={() => deleteStudent(student)}><X size={15} /></IconButton></div></td>
                   </tr>
                 );
               })}
@@ -1483,7 +1755,7 @@ function App() {
   function renderTeachersPage() {
     return (
       <div className="panel">
-        <div className="panel-heading"><div><h2>מורות ומקצועות</h2><p>מינימום נוכחות ניתן לשינוי לכל מורה ולכל יום.</p></div><button className="button button-primary" type="button" onClick={() => setToast("הוספת מורה תתחבר לניהול משתמשים בהמשך")}><Plus size={16} /> מורה חדשה</button></div>
+        <div className="panel-heading"><div><h2>מורות ומקצועות</h2><p>מינימום נוכחות ניתן לשינוי לכל מורה ולכל יום.</p></div><button className="button button-primary" type="button" onClick={() => openEntity(newTeacherDraft())}><Plus size={16} /> מורה חדשה</button></div>
         <div className="teacher-list">
           {teachers.map((teacher) => {
             const weeklyLessons = data.lessons.filter((lesson) => lesson.teacherId === teacher.id).length;
@@ -1501,6 +1773,7 @@ function App() {
                     <Settings2 size={15} /> שעות
                   </button>
                   <button className="button button-secondary" type="button" onClick={() => { setSelectedTeacherId(teacher.id); setRole("teacher"); navigate("daily"); }}>תצוגת מורה</button>
+                  <div className="row-actions"><IconButton label="עריכה" onClick={() => openEntity(editTeacherDraft(teacher))}><Pencil size={15} /></IconButton><IconButton label="מחיקה" onClick={() => deleteTeacher(teacher)}><X size={15} /></IconButton></div>
                 </div>
                 {teacherSettingsOpen === teacher.id && (
                   <div className="teacher-work-settings">
@@ -1541,11 +1814,11 @@ function App() {
     const groups = data.lessons.filter((lesson) => lesson.groupId);
     return (
       <section className="panel">
-        <div className="panel-heading"><div><h2>קבוצות למידה</h2><p>קבוצות מוגדרות על ידי המנהל/ת ומשובצות כמפגש אחד.</p></div><button className="button button-primary" type="button" onClick={() => setToast("יצירת קבוצה תיפתח כחלק מטופס השיבוץ")}><Plus size={16} /> קבוצה חדשה</button></div>
+        <div className="panel-heading"><div><h2>קבוצות למידה</h2><p>קבוצות מוגדרות על ידי המנהל/ת ומשובצות כמפגש אחד.</p></div><button className="button button-primary" type="button" onClick={openCreateGroup}><Plus size={16} /> קבוצה חדשה</button></div>
         <div className="group-grid">
-          {groups.slice(0, 28).map((lesson) => (
+          {groups.map((lesson) => (
             <article className="group-card" key={lesson.id}>
-              <div className="group-card-top"><span className={`subject-pill ${subjectClass(lesson.subjectId)}`}>{subjectName(lesson.subjectId)}</span><span className="neutral-chip">{getHomeroom(getStudent(lesson.studentIds[0] ?? "")?.homeroomId ?? "")?.name}</span></div>
+              <div className="group-card-top"><span className={`subject-pill ${subjectClass(lesson.subjectId)}`}>{subjectName(lesson.subjectId)}</span><span className="neutral-chip">{getHomeroom(getStudent(lesson.studentIds[0] ?? "")?.homeroomId ?? "")?.name}</span><IconButton label="עריכת קבוצה" onClick={() => openEditLesson(lesson)}><Pencil size={15} /></IconButton></div>
               <h3>{lesson.groupName}</h3>
               <div className="group-members">{lesson.studentIds.map((id) => getStudent(id)?.displayName).filter(Boolean).join(" · ")}</div>
               <div className="group-card-footer"><span>{getTeacher(lesson.teacherId)?.name}</span><span>{DAYS[lesson.day].short} · שעה {lesson.period + 1}</span></div>
@@ -1637,13 +1910,14 @@ function App() {
     });
     return (
       <section className="panel">
-        <div className="panel-heading"><div><h2>מיקומים וחדרים</h2><p>התנגשות מקום היא אזהרה בלבד ואינה חוסמת שיבוץ.</p></div><button className="button button-primary" type="button" onClick={() => setToast("ניהול חדרים מלא יתווסף עם חיבור למסד נתונים")}><Plus size={16} /> מיקום חדש</button></div>
+        <div className="panel-heading"><div><h2>מיקומים וחדרים</h2><p>התנגשות מקום היא אזהרה בלבד ואינה חוסמת שיבוץ.</p></div><button className="button button-primary" type="button" onClick={() => openEntity({ kind: "location", name: "" })}><Plus size={16} /> מיקום חדש</button></div>
         <div className="location-grid">
           {roomStats.map((item) => (
             <article className="location-card" key={item.location}>
               <span className="location-icon"><MapPin size={18} /></span>
               <div><strong>{item.location}</strong><small>{item.count} שיבוצים השבוע</small></div>
               <span className={`badge ${item.warnings ? "badge-warning" : "badge-success"}`}>{item.warnings ? "אזהרה" : "תקין"}</span>
+              <div className="row-actions"><IconButton label="עריכה" onClick={() => openEntity({ kind: "location", id: item.location, name: item.location })}><Pencil size={15} /></IconButton><IconButton label="מחיקה" onClick={() => deleteLocation(item.location)}><X size={15} /></IconButton></div>
             </article>
           ))}
         </div>
@@ -1855,7 +2129,7 @@ function App() {
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setModalDraft(null); }}>
           <form className="modal-card" onSubmit={saveLesson}>
             <div className="modal-header">
-              <div><span className="modal-kicker">ניהול מערכת</span><h2>{modalDraft.id ? "עריכת שיבוץ" : "יצירת שיבוץ חדש"}</h2></div>
+              <div><span className="modal-kicker">ניהול מערכת</span><h2>{modalDraft.asGroup ? (modalDraft.id ? "עריכת קבוצה" : "יצירת קבוצה חדשה") : modalDraft.id ? "עריכת שיבוץ" : "יצירת שיבוץ חדש"}</h2></div>
               <IconButton label="סגירה" onClick={() => setModalDraft(null)}><X size={19} /></IconButton>
             </div>
             <div className="form-grid">
@@ -1876,6 +2150,9 @@ function App() {
                   <option value="once">רק השבוע {weekDateRange(weekOffset)}</option>
                 </select>
               </label>
+              {modalDraft.studentIds.length > 1 && (
+                <label className="field-label field-wide">שם הקבוצה<input value={modalDraft.groupName ?? ""} placeholder={`קבוצת ${subjectName(modalDraft.subjectId)}`} onChange={(event) => setModalDraft({ ...modalDraft, groupName: event.target.value })} /></label>
+              )}
               <div className="field-wide student-picker">
                 <div className="student-picker-heading"><span>תלמידים/ות וקבוצות</span><small>{modalDraft.studentIds.length} נבחרו</small></div>
                 <div className="student-picker-list">
@@ -1892,6 +2169,91 @@ function App() {
             <div className="modal-footer">
               <span className="form-footnote">התנגשות מקום תוצג כאזהרה בלבד.</span>
               <div><button className="button button-secondary" type="button" onClick={() => setModalDraft(null)}>ביטול</button><button className="button button-primary" type="submit"><Check size={16} /> שמירת שיבוץ</button></div>
+            </div>
+          </form>
+        </div>
+      )}
+      {entityDraft && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setEntityDraft(null); }}>
+          <form className="modal-card" onSubmit={saveEntity}>
+            <div className="modal-header">
+              <div>
+                <span className="modal-kicker">ניהול נתונים</span>
+                <h2>{{ teacher: "מורה", student: "תלמיד/ה", exam: "מבחן", location: "מיקום" }[entityDraft.kind]} · {entityDraft.id ? "עריכה" : "הוספה"}</h2>
+              </div>
+              <IconButton label="סגירה" onClick={() => setEntityDraft(null)}><X size={19} /></IconButton>
+            </div>
+            <div className="form-grid">
+              {entityDraft.kind === "teacher" && (
+                <>
+                  <label className="field-label field-wide">שם מלא<input value={entityDraft.name} onChange={(event) => setEntityDraft({ ...entityDraft, name: event.target.value })} /></label>
+                  <div className="field-wide student-picker">
+                    <div className="student-picker-heading"><span>מקצועות</span></div>
+                    <div className="student-picker-list">
+                      {SUBJECTS.map((subject) => (
+                        <label className="student-check" key={subject.id}>
+                          <input type="checkbox" checked={entityDraft.subjectIds.includes(subject.id)} onChange={() => setEntityDraft({ ...entityDraft, subjectIds: entityDraft.subjectIds.includes(subject.id) ? entityDraft.subjectIds.filter((id) => id !== subject.id) : [...entityDraft.subjectIds, subject.id] })} />
+                          <span>{subject.name}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="field-wide student-picker">
+                    <div className="student-picker-heading"><span>ימי עבודה ושעות נוכחות</span></div>
+                    {DAYS.map((day) => {
+                      const value = entityDraft.days[day.index];
+                      const setDay = (patch: Partial<typeof value>) => setEntityDraft({ ...entityDraft, days: { ...entityDraft.days, [day.index]: { ...value, ...patch } } });
+                      return (
+                        <div className="teacher-day-setting form-row" key={day.index}>
+                          <label className="student-check"><input type="checkbox" checked={value.on} onChange={() => setDay({ on: !value.on })} /><span>{day.label}</span></label>
+                          <select disabled={!value.on} value={value.start} aria-label={`התחלה ${day.label}`} onChange={(event) => setDay({ start: Number(event.target.value) })}>{PERIODS.map((period) => <option value={period.index} key={period.index}>{period.start}</option>)}</select>
+                          <select disabled={!value.on} value={value.end} aria-label={`סיום ${day.label}`} onChange={(event) => setDay({ end: Number(event.target.value) })}>{PERIODS.map((period) => <option value={period.index + 1} key={period.index}>{period.end}</option>)}</select>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+              {entityDraft.kind === "student" && (
+                <>
+                  <label className="field-label">שם פרטי<input value={entityDraft.firstName} onChange={(event) => setEntityDraft({ ...entityDraft, firstName: event.target.value })} /></label>
+                  <label className="field-label">אות ראשונה של השם השני<input maxLength={1} value={entityDraft.secondInitial} onChange={(event) => setEntityDraft({ ...entityDraft, secondInitial: event.target.value })} /></label>
+                  <label className="field-label">שכבה<select value={entityDraft.grade} onChange={(event) => setEntityDraft({ ...entityDraft, grade: event.target.value, homeroomId: homerooms.find((room) => room.grade === event.target.value)?.id ?? "" })}>{GRADES.map((grade) => <option key={grade}>{grade}</option>)}</select></label>
+                  <label className="field-label">כיתה<select value={entityDraft.homeroomId} onChange={(event) => setEntityDraft({ ...entityDraft, homeroomId: event.target.value })}>{homerooms.filter((room) => room.grade === entityDraft.grade).map((room) => <option value={room.id} key={room.id}>{room.name}</option>)}</select></label>
+                  <div className="field-wide student-picker">
+                    <div className="student-picker-heading"><span>מקצועות תגבור ומורה קבועה</span></div>
+                    {SUBJECTS.map((subject) => {
+                      const checked = entityDraft.subjectIds.includes(subject.id);
+                      return (
+                        <div className="teacher-day-setting form-row" key={subject.id}>
+                          <label className="student-check"><input type="checkbox" checked={checked} onChange={() => setEntityDraft({ ...entityDraft, subjectIds: checked ? entityDraft.subjectIds.filter((id) => id !== subject.id) : [...entityDraft.subjectIds, subject.id] })} /><span>{subject.name}</span></label>
+                          <select disabled={!checked} value={entityDraft.teacherBySubject[subject.id] ?? ""} aria-label={`מורה ל${subject.name}`} onChange={(event) => setEntityDraft({ ...entityDraft, teacherBySubject: { ...entityDraft.teacherBySubject, [subject.id]: event.target.value || undefined } })}>
+                            <option value="">ללא מורה קבועה</option>
+                            {teachers.filter((teacher) => teacher.subjectIds.includes(subject.id)).map((teacher) => <option value={teacher.id} key={teacher.id}>{teacher.name}</option>)}
+                          </select>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+              {entityDraft.kind === "exam" && (
+                <>
+                  <label className="field-label field-wide">כותרת<input value={entityDraft.title} onChange={(event) => setEntityDraft({ ...entityDraft, title: event.target.value })} /></label>
+                  <label className="field-label">שכבה<select value={entityDraft.grade} onChange={(event) => setEntityDraft({ ...entityDraft, grade: event.target.value })}>{GRADES.map((grade) => <option key={grade}>{grade}</option>)}</select></label>
+                  <label className="field-label">מקצוע<select value={entityDraft.subjectId} onChange={(event) => setEntityDraft({ ...entityDraft, subjectId: event.target.value as SubjectId })}>{SUBJECTS.map((subject) => <option value={subject.id} key={subject.id}>{subject.name}</option>)}</select></label>
+                  <label className="field-label">תאריך<input type="date" value={entityDraft.date} onChange={(event) => setEntityDraft({ ...entityDraft, date: event.target.value })} /></label>
+                  <label className="field-label">שעה<select value={entityDraft.period} onChange={(event) => setEntityDraft({ ...entityDraft, period: Number(event.target.value) })}>{PERIODS.map((period) => <option value={period.index} key={period.index}>{period.label} · {period.start}–{period.end}</option>)}</select></label>
+                </>
+              )}
+              {entityDraft.kind === "location" && (
+                <label className="field-label field-wide">שם המיקום<input value={entityDraft.name} onChange={(event) => setEntityDraft({ ...entityDraft, name: event.target.value })} /></label>
+              )}
+            </div>
+            {entityError && <div className="form-error"><ShieldAlert size={16} />{entityError}</div>}
+            <div className="modal-footer">
+              <span className="form-footnote">הנתונים נשמרים בדפדפן בלבד (נתוני הדגמה).</span>
+              <div><button className="button button-secondary" type="button" onClick={() => setEntityDraft(null)}>ביטול</button><button className="button button-primary" type="submit"><Check size={16} /> שמירה</button></div>
             </div>
           </form>
         </div>
@@ -1936,13 +2298,16 @@ function RuleItem({ text }: { text: string }) {
   return <div className="rule-item"><span><Check size={13} /></span>{text}</div>;
 }
 
-function ExamRow({ exam }: { exam: Exam }) {
+function ExamRow({ exam, onEdit, onDelete }: { exam: Exam; onEdit?: () => void; onDelete?: () => void }) {
   return (
     <div className="exam-row">
       <span className={`subject-dot ${subjectClass(exam.subjectId)}`} />
       <div className="exam-row-info"><strong>{exam.title}</strong><small>{DAYS[exam.day].label} · {exam.grade} · שעה {exam.period + 1}</small></div>
       <span className={`subject-pill ${subjectClass(exam.subjectId)}`}>{subjectName(exam.subjectId)}</span>
       <span className="exam-countdown">בעוד {exam.dateOffset} ימים</span>
+      {onEdit && onDelete && (
+        <div className="row-actions"><IconButton label="עריכה" onClick={onEdit}><Pencil size={15} /></IconButton><IconButton label="מחיקה" onClick={onDelete}><X size={15} /></IconButton></div>
+      )}
     </div>
   );
 }
